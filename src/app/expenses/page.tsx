@@ -87,6 +87,7 @@ export default function ExpensesPage() {
   const [vendors, setVendors] = useState<Vendor[]>([])
   const [categories, setCategories] = useState<Category[]>([])
   const [myHotelIds, setMyHotelIds] = useState<string[]>([])
+  const [accessLoaded, setAccessLoaded] = useState(false)
 
   // filters
   const today = new Date()
@@ -117,20 +118,31 @@ export default function ExpensesPage() {
         setHotels((hs ?? []) as Hotel[])
         setVendors((vs ?? []) as Vendor[])
         setCategories((cs ?? []) as Category[])
-
-        // derive membership (if none recorded, fall back to all hotels)
-        const [{ data: mh }, { data: authUser }] = await Promise.all([
-          supabase.from('member_hotels').select('user_id,hotel_id'),
-          supabase.auth.getUser(),
-        ])
-        const uid = authUser.user?.id
-        const members = (mh ?? []) as { user_id: string; hotel_id: string }[]
-        const mine = uid
-          ? members.filter(m => m.user_id === uid).map(m => m.hotel_id)
-          : []
-        setMyHotelIds(mine.length ? mine : ((hs ?? []) as Hotel[]).map(h => h.id))
-      } catch (e: any) {
-        setErr(e?.message ?? 'Failed to load lookups')
+        try {
+          const res = await fetch('/api/me/hotels', { cache: 'no-store' })
+          if (res.ok) {
+            const json = await res.json()
+            const ids = Array.isArray(json.hotelIds) ? (json.hotelIds as string[]) : []
+            setMyHotelIds(prev => {
+              if (prev.length === ids.length && prev.every((id, i) => id === ids[i])) {
+                return prev
+              }
+              return ids
+            })
+          } else {
+            const json = await res.json().catch(() => null)
+            throw new Error(json?.error || 'Failed to load member access')
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to load member access'
+          setErr(message)
+        } finally {
+          setAccessLoaded(true)
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to load lookups'
+        setErr(message)
+        setAccessLoaded(true)
       }
     })()
   }, [])
@@ -149,6 +161,8 @@ export default function ExpensesPage() {
 
   // ---- fetch month data
   useEffect(() => {
+    if (!accessLoaded) return
+
     ;(async () => {
       setLoading(true); setErr(null)
       try {
@@ -156,77 +170,40 @@ export default function ExpensesPage() {
         const from = month === 'all' ? startOfMonth(year, 1) : startOfMonth(year, month)
         const to = month === 'all' ? endOfMonth(year, 12) : endOfMonth(year, month)
 
-        let result: Row[] = []
+        const params = new URLSearchParams({ from, to })
+        params.set('hotelId', hotelId === 'all' ? 'all' : hotelId)
+        if (vendorId !== 'all') params.set('vendorId', vendorId)
+        if (categoryId !== 'all') params.set('categoryId', categoryId)
+        if (method !== 'all') params.set('method', method)
+        if (search.trim()) params.set('search', search.trim())
 
-        if (hotelId !== 'all') {
-          // Use the RPC for a single hotel
-          const { data, error } = await supabase.rpc('list_expenses_by_month', {
-            p_hotel_id: hotelId,
-            p_from: from,
-            p_to: to,
-          })
-          if (error) throw error
-          result = (data ?? []) as Row[]
-        } else {
-          // All my hotels: do a SELECT with joins
-          const { data, error } = await supabase
-            .from('expenses')
-            .select(`
-              id,
-              expense_date,
-              amount,
-              method,
-              reference,
-              notes,
-              project_id,
-              vendors(name),
-              expense_categories(name)
-            `)
-            .gte('expense_date', from)
-            .lte('expense_date', to)
-            .in('hotel_id', myHotelIds)
-            .order('expense_date', { ascending: false })
-            .order('created_at', { ascending: false })
-
-          if (error) throw error
-          result = (data ?? []).map((r: any) => ({
-            id: r.id,
-            expense_date: r.expense_date,
-            vendor_name: r.vendors?.name ?? null,
-            category_name: r.expense_categories?.name ?? null,
-            amount: Number(r.amount || 0),
-            method: r.method,
-            reference: r.reference ?? null,
-            notes: r.notes ?? null,
-            project_id: r.project_id ?? null,
-          }))
+        const res = await fetch(`/api/expenses/list?${params.toString()}`, { cache: 'no-store' })
+        const json = await res.json().catch(() => null)
+        if (!res.ok) {
+          throw new Error(json?.error || 'Failed to load expenses')
         }
 
-        // client-side filter by vendor/category/method and search (vendor/category/ref/notes)
-        const s = search.trim().toLowerCase()
-        const filtered = result.filter(r => {
-          const vendorOk = vendorId === 'all' || vendors.find(v => v.id === vendorId)?.name === r.vendor_name
-          const catOk = categoryId === 'all' || categories.find(c => c.id === categoryId)?.name === r.category_name
-          const methodOk = method === 'all' || r.method === method
-          const hay = [
-            r.vendor_name ?? '',
-            r.category_name ?? '',
-            r.reference ?? '',
-            r.notes ?? '',
-          ].join(' ').toLowerCase()
-          const searchOk = !s || hay.includes(s)
-          return vendorOk && catOk && methodOk && searchOk
-        })
+        const apiRows = Array.isArray(json?.rows) ? (json.rows as Row[]) : []
+        setRows(apiRows)
 
-        setRows(filtered)
-      } catch (e: any) {
-        setErr(e?.message ?? 'Failed to load expenses')
+        if (Array.isArray(json?.hotelIds)) {
+          const ids = json.hotelIds as string[]
+          setMyHotelIds(prev => {
+            if (prev.length === ids.length && prev.every((id, i) => id === ids[i])) {
+              return prev
+            }
+            return ids
+          })
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to load expenses'
+        setErr(message)
         setRows([])
       } finally {
         setLoading(false)
       }
     })()
-  }, [year, month, hotelId, myHotelIds, vendorId, categoryId, method, search, vendors, categories])
+  }, [year, month, hotelId, vendorId, categoryId, method, search, accessLoaded])
 
   // ---- totals
   const total = useMemo(() => rows.reduce((a, r) => a + Number(r.amount || 0), 0), [rows])
@@ -318,7 +295,10 @@ export default function ExpensesPage() {
           <div className="flex flex-wrap gap-2 mb-4">
             <select
               value={hotelId}
-              onChange={(e) => setHotelId(e.target.value as any)}
+              onChange={(e) => {
+                const value = e.target.value
+                setHotelId(value === 'all' ? 'all' : value)
+              }}
               className="border rounded p-2"
             >
               <option value="all">All hotels</option>
@@ -338,17 +318,40 @@ export default function ExpensesPage() {
               ))}
             </select>
 
-            <select value={vendorId} onChange={e => setVendorId(e.target.value as any)} className="border rounded p-2">
+            <select
+              value={vendorId}
+              onChange={e => {
+                const value = e.target.value
+                setVendorId(value === 'all' ? 'all' : value)
+              }}
+              className="border rounded p-2"
+            >
               <option value="all">All vendors</option>
               {vendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
             </select>
 
-            <select value={categoryId} onChange={e => setCategoryId(e.target.value as any)} className="border rounded p-2">
+            <select
+              value={categoryId}
+              onChange={e => {
+                const value = e.target.value
+                setCategoryId(value === 'all' ? 'all' : value)
+              }}
+              className="border rounded p-2"
+            >
               <option value="all">All categories</option>
               {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
             </select>
 
-            <select value={method} onChange={e => setMethod(e.target.value as any)} className="border rounded p-2">
+            <select
+              value={method}
+              onChange={e => {
+                const value = e.target.value as typeof method
+                if (value === 'all' || value === 'check' || value === 'ach' || value === 'card' || value === 'other') {
+                  setMethod(value)
+                }
+              }}
+              className="border rounded p-2"
+            >
               <option value="all">All methods</option>
               <option value="check">Check</option>
               <option value="ach">ACH</option>

@@ -68,6 +68,7 @@ export default function NewExpensePage() {
   const [vendors, setVendors] = useState<Vendor[]>([])
   const [categories, setCategories] = useState<Category[]>([])
   const [myHotelIds, setMyHotelIds] = useState<string[]>([])
+  const [accessLoaded, setAccessLoaded] = useState(false)
 
   // form
   const [hotelId, setHotelId] = useState<string>('')
@@ -99,18 +100,27 @@ export default function NewExpensePage() {
         setVendors((vs ?? []) as Vendor[])
         setCategories((cs ?? []) as Category[])
 
-        const [{ data: mh }, { data: authUser }] = await Promise.all([
-          supabase.from('member_hotels').select('user_id,hotel_id'),
-          supabase.auth.getUser(),
-        ])
-        const uid = authUser.user?.id
-        const members = (mh ?? []) as { user_id: string; hotel_id: string }[]
-        const mine = uid ? members.filter(m => m.user_id === uid).map(m => m.hotel_id) : []
-        const my = mine.length ? (hs ?? []).filter(h => mine.includes(h.id)) : (hs ?? [])
-        setMyHotelIds(my.map(h => h.id))
-        if (my.length) setHotelId(my[0].id)
-      } catch (e: any) {
-        setErr(e?.message ?? 'Failed to load lookups')
+        try {
+          const res = await fetch('/api/me/hotels', { cache: 'no-store' })
+          if (res.ok) {
+            const json = await res.json()
+            const ids = Array.isArray(json.hotelIds) ? (json.hotelIds as string[]) : []
+            setMyHotelIds(ids)
+            if (ids.length) setHotelId(ids[0])
+          } else {
+            const json = await res.json().catch(() => null)
+            throw new Error(json?.error || 'Failed to load member access')
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to load member access'
+          setErr(message)
+        } finally {
+          setAccessLoaded(true)
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to load lookups'
+        setErr(message)
+        setAccessLoaded(true)
       }
     })()
   }, [])
@@ -135,8 +145,7 @@ export default function NewExpensePage() {
 
 
     if (error) {
-
-        if ((error as any).code === '23505') {
+        if (typeof error === 'object' && error !== null && 'code' in error && (error as { code?: string }).code === '23505') {
           // unique violation; try to fetch existing by name
           const { data: existing } = await supabase
             .from('expense_categories')
@@ -182,9 +191,10 @@ export default function NewExpensePage() {
       const cId = await ensureCategory()
 
       // insert expense
-      const { data: exp, error: insErr } = await supabase
-        .from('expenses')
-        .insert({
+      const res = await fetch('/api/expenses/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
           hotel_id: hotelId,
           expense_date: expenseDate,
           vendor_id: vendorId,
@@ -193,12 +203,14 @@ export default function NewExpensePage() {
           method,
           reference: reference || null,
           notes: notes || null,
-        })
-        .select('id')
-        .single()
+        }),
+      })
+      const json = await res.json().catch(() => null)
+      if (!res.ok) {
+        throw new Error(json?.error || 'Failed to create expense')
+      }
 
-      if (insErr) throw insErr
-      const expenseId: string = exp.id
+      const expenseId: string = json.id
 
       // upload files (optional)
       if (files && files.length) {
@@ -214,8 +226,9 @@ export default function NewExpensePage() {
 
       setMsg('Expense created')
       router.push('/expenses')
-    } catch (e: any) {
-      setErr(e?.message ?? 'Failed to create expense')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to create expense'
+      setErr(message)
     } finally {
       setSaving(false)
     }
@@ -230,6 +243,9 @@ export default function NewExpensePage() {
         <p className="text-gray-700">You don’t have access to create expenses.</p>
       </main>
     )
+  }
+  if (!accessLoaded) {
+    return <main className="max-w-3xl mx-auto p-6">Loading…</main>
   }
   // --- End access gate ---
 
@@ -317,7 +333,17 @@ export default function NewExpensePage() {
 
           <label className="flex flex-col gap-1">
             <span className="text-sm text-gray-600">Method</span>
-            <select value={method} onChange={e => { setMethod(e.target.value as any); setReference('') }} className="border rounded p-2">
+            <select
+              value={method}
+              onChange={e => {
+                const value = e.target.value
+                if (value === 'check' || value === 'ach' || value === 'card' || value === 'other') {
+                  setMethod(value)
+                  setReference('')
+                }
+              }}
+              className="border rounded p-2"
+            >
               <option value="check">Check</option>
               <option value="ach">ACH</option>
               <option value="card">Card</option>
