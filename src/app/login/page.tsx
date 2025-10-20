@@ -24,7 +24,9 @@ export default function LoginPage() {
     setErr(null)
     setBusy(true)
 
-    const redirectTo = `${window.location.origin}/` // land on dashboard
+    // ✅ FIXED: Always use the production site URL + /auth/callback
+    const redirectTo = `${process.env.NEXT_PUBLIC_SITE_URL}/auth/callback`
+
     const { error } = await supabase.auth.signInWithOtp({
       email,
       options: { emailRedirectTo: redirectTo },
